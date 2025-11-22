@@ -1,0 +1,39 @@
+# --- 🛑 SECURITY (DO NOT UPLOAD) ---
+certs/
+secrets/
+*.key
+*.crt
+*.pem
+*.env
+.env
+
+# --- 🐘 HEAVY DATA (Prevent Uploading Databases) ---
+# Prevents uploading any local folders used for bind mounts
+# (Like the wazuh config folders we created earlier)
+wazuh-dashboard-config/
+wazuh-data/
+*-data/
+data/
+logs/
+*.log
+
+# --- 🐳 DOCKER SPECIFIC ---
+docker-compose.override.yml
+.docker/
+
+# --- 💻 OS & IDE JUNK ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# --- 🔮 FUTURE PROOFING (For your App/API) ---
+node_modules/
+dist/
+build/
+__pycache__/
+*.pyc
+venv/
+.venv/
+*.save
+*.save.*

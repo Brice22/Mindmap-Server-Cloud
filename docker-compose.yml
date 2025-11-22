@@ -1,0 +1,461 @@
+services:
+  # --- CERTIFICATE SETUP (Runs Once) ---
+  setup:
+    image: docker.elastic.co/elasticsearch/elasticsearch:${ELASTIC_VERSION}
+    volumes:
+      - certs-data:/usr/share/elasticsearch/config/certs
+    user: "0"
+    command: >
+      bash -c '
+        if [ x\${ELASTIC_PASSWORD} == x ]; then
+          echo "Set the ELASTIC_PASSWORD environment variable in the .env file";
+          exit 1;
+        fi;
+        if [ ! -f config/certs/ca.zip ]; then
+          echo "Creating CA";
+          bin/elasticsearch-certutil ca --silent --pem -out config/certs/ca.zip;
+          unzip config/certs/ca.zip -d config/certs;
+        fi;
+        if [ ! -f config/certs/certs.zip ]; then
+          echo "Creating certs";
+          echo -ne \
+          "instances:\n"\
+          "  - name: elasticsearch\n"\
+          "    dns:\n"\
+          "      - elasticsearch\n"\
+          "      - localhost\n"\
+          "    ip:\n"\
+          "      - 127.0.0.1\n"\
+          > config/certs/instances.yml;
+          bin/elasticsearch-certutil cert --silent --pem -out config/certs/certs.zip --in config/certs/instances.yml --ca-cert config/certs/ca/ca.crt --ca-key config/certs/ca/ca.key;
+          unzip config/certs/certs.zip -d config/certs;
+        fi;
+        echo "Setting file permissions"
+        chown -R 1000:0 config/certs
+        find . -type d -exec chmod 750 \{\} \;;
+        find . -type f -exec chmod 640 \{\} \;;
+        echo "Waiting for Elasticsearch availability";
+        until curl -s --cacert config/certs/ca/ca.crt https://elasticsearch:9200 | grep -q "missing authentication credentials"; do sleep 30; done;
+        echo "All done!";
+      '
+    healthcheck:
+      test: ["CMD-SHELL", "[ -f config/certs/elasticsearch/elasticsearch.crt ]"]
+      interval: 1s
+      timeout: 5s
+      retries: 120
+      start_period: 120s
+    networks:
+      - backend-net
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:${ELASTIC_VERSION}
+    container_name: elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=true
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+      - xpack.security.http.ssl.enabled=true
+      - xpack.security.transport.ssl.enabled=true
+      # Optimization: Set default shards for large datasets (millions of records)
+      - "cluster.name=docker-cluster"
+      - xpack.security.http.ssl.key=certs/elasticsearch/elasticsearch.key
+      - xpack.security.http.ssl.certificate=certs/elasticsearch/elasticsearch.crt
+      - xpack.security.http.ssl.certificate_authorities=certs/ca/ca.crt
+      - "bootstrap.memory_lock=false"
+      - "ES_JAVA_OPTS=-Xms1g -Xmx1g"
+      - xpack.security.transport.ssl.key=certs/elasticsearch/elasticsearch.key
+      - xpack.security.transport.ssl.certificate=certs/elasticsearch/elasticsearch.crt
+      - xpack.security.transport.ssl.certificate_authorities=certs/ca/ca.crt
+      - "cluster.name=docker-cluster"
+    volumes:
+      - /the-reservoir/docker-data-root/elasticsearch:/usr/share/elasticsearch/data
+      - certs-data:/usr/share/elasticsearch/config/certs # Generates certs here
+    networks:
+       backend-net:
+          aliases:
+            - wazuh.indexer
+
+    healthcheck:
+      test: ["CMD-SHELL", "curl -k -s -f -u elastic:${ELASTIC_PASSWORD} https://localhost:9200/_cluster/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+    mem_limit: 2g
+    cpus: 1.0
+    restart: unless-stopped
+
+  logstash:
+    image: docker.elastic.co/logstash/logstash:9.2.1
+    container_name: logstash
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    environment:
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+    networks:
+      - logging-net
+    volumes:
+      - ./logstash.conf:/usr/share/logstash/pipeline/logstash.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9600 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    mem_limit: 1g
+    cpus: 0.5
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:latest
+    container_name: nginx-gatekeeper
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./certs:/etc/nginx/certs:ro
+    ports:
+      - "8443:8443" # Gate to Keycloak
+      - "8000:8000" # Gate to SurrealDB
+      - "9201:9201" # Gate to Elastic
+      - "5602:5602" #kibana dashboard
+      - "7700:7700" #meili
+      - "8080:8080" #jenkins
+      - "5601:5601" # Wazuh Dashboard
+      - "8001:8001"
+    networks:
+      - backend-net   # To talk to the hidden services
+      - security-net  # To talk to the host (You)
+      - ci-net      # <--- ADD THIS (To reach Jenkins)
+      - logging-net # (For Kibana)
+      - search-net      # Meilisearch
+      - monitoring-net # (For Prometheus)
+    restart: unless-stopped
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:${ELASTIC_VERSION}
+    container_name: kibana
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    environment:
+      - ELASTICSEARCH_HOSTS=["https://elasticsearch:9200"]
+      - ELASTICSEARCH_USERNAME=kibana_system
+      - ELASTICSEARCH_PASSWORD=${ELASTIC_PASSWORD}
+      - ELASTICSEARCH_SSL_VERIFICATIONMODE=none
+      - ELASTICSEARCH_SSL_CERTIFICATEAUTHORITY=/usr/share/elasticsearch/config/certs/http_ca.crt
+    ports:
+      - "5601:5601"
+    volumes:
+      - certs-data:/usr/share/elasticsearch/config/certs:ro # Reads certs from here
+    networks:
+      - logging-net
+      - backend-net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -I http://localhost:5601/login | grep -q 200"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    mem_limit: 1g
+    cpus: 0.5
+    restart: unless-stopped
+
+  keydb:
+    image: eqalpha/keydb:latest
+    container_name: keydb
+    volumes:
+      - keydb-data:/data
+    networks:
+      - backend-net
+    healthcheck:
+      test: ["CMD", "keydb-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    mem_limit: 512m
+    cpus: 0.5
+
+  meilisearch:
+    image: getmeili/meilisearch:latest
+    container_name: meilisearch
+    environment:
+      - MEILI_MASTER_KEY=ezZTtAU6xJg_fU4JbmtwxeIqMBg9VFTEQgqP9hBw520
+      - MEILI_ENV=production
+    volumes:
+      - /the-reservoir/docker-data-root/meilisearch:/meili_data
+    ports:
+      - "7700:7700"
+    networks:
+      - search-net
+      - backend-net
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--spider", "--tries=1", "http://127.0.0.1:7700/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 8
+      start_period: 120s
+    mem_limit: 256m
+    cpus: 0.25
+    restart: unless-stopped
+
+  jenkins:
+    image: jenkins/jenkins:2.528.2-lts-jdk21
+    container_name: jenkins
+    ports:
+      - "50000:50000"
+    volumes:
+      - /the-reservoir/docker-data-root/jenkins:/var/jenkins_home
+    networks:
+      - ci-net
+      - backend-net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/login || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    mem_limit: 2g
+    cpus: 1.0
+    restart: unless-stopped
+
+  mindsdb:
+    image: mindsdb/mindsdb:v25.11.0rc1
+    container_name: mindsdb
+    ports:
+      - "47334:47334"
+    volumes:
+      - mindsdb-data:/root/mindsdb
+    networks:
+      - security-net
+      - backend-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:47334"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    mem_limit: 4g
+    cpus: 2.0
+
+  neo4j:
+    image: neo4j:5.26
+    container_name: neo4j
+    environment:
+      - NEO4J_AUTH=neo4j/${NEO4J_PASSWORD}
+      - NEO4J_PLUGINS=["apoc"]
+    volumes:
+      - neo4j-data:/data
+      - neo4j-logs:/logs
+    ports:
+      - "7687:7687"
+    networks:
+      - backend-net
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "http://localhost:7474"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    mem_limit: 2g
+    cpus: 1.0
+
+  openldap:
+    image: osixia/openldap:1.5.0
+    container_name: openldap
+    ports:
+      - "636:636"
+    volumes:
+      - ldap-data:/var/lib/ldap
+      - ldap-config:/etc/ldap/slapd.d
+    networks:
+      - backend-net
+    healthcheck:
+      test: ["CMD-SHELL", "ldapwhoami -H ldap://localhost -x || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    mem_limit: 512m
+    cpus: 0.5
+
+  prometheus:
+    image: prom/prometheus:v3.7.3
+    container_name: prometheus
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - prom-data:/prometheus
+    command: --config.file=/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+    networks:
+      - monitoring-net
+      - backend-net
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    mem_limit: 1g
+    cpus: 0.5
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.4
+    container_name: keycloak
+    environment:
+      - KEYCLOAK_ADMIN=admin
+      - KEYCLOAK_ADMIN_PASSWORD=${KEYCLOAK_ADMIN_PASSWORD}
+      - KC_PROXY_HEADERS=xforwarded  # Trust Nginx
+      - KC_HOSTNAME_STRICT=false     # Don't crash if accessed via IP
+      - KC_HOSTNAME_STRICT_HTTPS=false # Allow HTTP for now
+      - KC_HTTP_ENABLED=true         # Listen on HTTP 8080
+      - KC_HOSTNAME=https://192.168.4.194:8443 # Explicitly set the Public URL (IP:Port) 
+    command: start
+    networks:
+      - backend-net
+    volumes:
+      - /the-reservoir/docker-data-root/keycloak:/opt/keycloak/data
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/8080"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+    mem_limit: 1g
+    cpus: 0.75
+    restart: unless-stopped
+    depends_on:
+      - openldap  # If integrating LDAP
+
+  surrealdb:
+    image: surrealdb/surrealdb:latest
+    container_name: surrealdb
+    command: start file:///my/data
+    user: root
+    volumes:
+      - /the-reservoir/docker-data-root/surrealdb:/my/data # <--- Absolute path
+    networks:
+      - backend-net
+    healthcheck:
+      test: ["CMD", "/surreal", "is-ready", "--conn", "http://localhost:8000"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    mem_limit: 512m
+    cpus: 0.5
+
+  wazuh-manager:
+    image: wazuh/wazuh-manager:${WAZUH_VERSION}
+    container_name: wazuh-manager
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+        required: true
+    environment:
+      - INDEXER_URL=https://elasticsearch:9200
+      - INDEXER_PROTOCOL=https
+      - ELASTICSEARCH_URL=https://elasticsearch:9200
+      - ELASTICSEARCH_PROTOCOL=https
+      - ELASTICSEARCH_USER=elastic
+      - INDEXER_USERNAME=elastic
+      - INDEXER_PASSWORD=${ELASTIC_PASSWORD}
+      - ELASTICSEARCH_PASSWORD=${ELASTIC_PASSWORD}
+      - API_PASSWORD=SuperSecret2025!
+      # SECURITY UPGRADE: Full SSL Verification enabled
+      - FILEBEAT_SSL_VERIFICATION_MODE=none
+      - INDEXER_SSL_CERTIFICATE_AUTHORITIES=/etc/ssl/certs/elastic/http_ca.crt
+    ports:
+      - "1514:1514/udp"
+      - "1515:1515/tcp"
+      - "5514:514/udp"
+      - "55000:55000" #api
+    volumes:
+      - wazuh-data:/var/ossec/data
+# Mount the shared certs so Wazuh can trust Elasticsearch
+      - certs-data:/etc/ssl/certs/elastic:ro
+    networks:
+      - backend-net  # To store data in Elasticsearch
+      - security-net # To fetch CVE updates from Internet
+    healthcheck:
+      test: ["CMD-SHELL", "ps aux | grep wazuh-analysisd | grep -v grep || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 120s  # Give analysisd time to start
+    mem_limit: 3g
+    cpus: 1.0
+    restart: unless-stopped
+
+  vaultwarden:
+    image: vaultwarden/server:latest
+    container_name: vaultwarden
+    environment:
+      - SIGNUPS_ALLOWED=true  # Set to false after you create your account!
+      - DOMAIN=https://192.168.4.194:8001
+    volumes:
+      - vaultwarden-data:/data
+    networks:
+      - backend-net
+    restart: unless-stopped
+  
+  suricata:
+    image: jasonish/suricata:7.0.11
+    container_name: suricata
+    network_mode: host  # For traffic inspection
+    volumes:
+      - ./suricata.yaml:/etc/suricata/suricata.yaml
+      - suricata-logs:/var/log/suricata  # <--- Add this line
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+      - SYS_NICE
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep suricata || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    mem_limit: 1g
+    cpus: 1.0
+
+networks:
+  # PUBLIC NETWORKS (Have Internet)
+  security-net:
+    driver: bridge
+    internal: false # Internet for Wazuh updates
+  
+  ci-net:
+    driver: bridge
+    internal: false # Internet for Jenkins plugins
+
+  # INTERNAL NETWORKS (Isolated - No Internet)
+  backend-net:
+    driver: bridge
+    internal: true # Secure Data Layer
+  
+  logging-net:
+    driver: bridge
+    internal: true # High volume logs
+  
+  search-net:
+    driver: bridge
+    internal: true # Search traffic
+  
+  monitoring-net:
+    driver: bridge
+    internal: true # Metrics traffic
+
+volumes:
+  es-data:
+  keydb-data:
+  meili-data:
+  jenkins-home:
+  mindsdb-data:
+  neo4j-data:
+  neo4j-logs:
+  backend_keycloak-data:
+  vaultwarden-data:
+  backend_openldap-data:
+  backend_openldap-data-db:
+  ldap-data:
+  ldap-config:
+  prom-data:
+  surrealdb-data:
+  suricata-logs:
+  certs-data:
+  wazuh-data:
+secrets:
+  elastic_password:
+    file: ./secrets/elastic_pass.txt  # Example secret file
