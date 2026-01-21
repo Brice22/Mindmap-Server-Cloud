@@ -1,6 +1,9 @@
 'use client';
 import { useEffect, useRef, useState } from 'react';
 import * as d3 from 'd3';
+import { io } from 'socket.io-client'; // 1. Import Socket.io
+
+const SOCKET_URL = 'https://10.10.0.1';
 
 interface Node { id: number; name: string; metadata: any; type?: string; x?: number; y?: number; description?: string; }
 interface GraphProps {
@@ -16,6 +19,33 @@ export default function MindMapGraph({ data, onNodeClick, onNodeDoubleClick, sel
   const svgRef = useRef<SVGSVGElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const [dimensions, setDimensions] = useState({ width: 800, height: 600 });
+  const socketRef = useRef<any>(null);
+
+  useEffect(() => {
+    socketRef.current = io(`${SOCKET_URL}/mindmap`, {
+      path: '/mindmap-socket/socket.io/', 
+      transports: ['websocket'], // Bypasses polling to avoid Mixed Content errors
+      secure: true,
+      reconnection: true
+ });
+
+    socketRef.current?.on('connect', () => {
+      console.log('DEBUG: Is socket defined?', !!socketRef.current);
+      console.log('✅ Mindmap Socket Connected with ID:', socketRef.current.id);
+  });
+
+    socketRef.current?.on('connect_error', (err) => {
+      console.error('❌ Socket Connection Error:', err.message);
+  });
+
+    // Listen for other users moving nodes
+    socketRef.current?.on('node_moved', (movedData: { id: number, x: number, y: number }) => {
+      d3.select(`#node-group-${movedData.id}`)
+        .attr("transform", `translate(${movedData.x},${movedData.y})`);
+    });
+
+    return () => { socketRef.current?.disconnect(); };
+  }, []);
 
   useEffect(() => {
     const handleResize = () => {
@@ -45,11 +75,22 @@ export default function MindMapGraph({ data, onNodeClick, onNodeDoubleClick, sel
     svg.call(zoom as any).on("dblclick.zoom", null);
 
     // FIX: Properly initialize coordinates so they don't stack at 0,0
-    const d3Nodes = visibleData.map(d => ({ 
-        ...d, 
-        x: (d.x && d.x !== 0) ? d.x : dimensions.width / 2 + (Math.random() - 0.5) * 100, 
-        y: (d.y && d.y !== 0) ? d.y : dimensions.height / 2 + (Math.random() - 0.5) * 100 
-    }));
+	console.log("RAW DATA FROM API:", data.find(n => n.id === 1));
+    const d3Nodes = visibleData.map(d => { 
+           const isZero = d.x === 0 && d.y === 0;
+           const hasPosition = d.x !== null && d.x !== undefined && !isZero;
+
+       return {
+           ...d,
+           // If it has a real position, use it. If it's 0,0 or null, center it.
+           x: hasPosition ? d.x : dimensions.width / 2 + (Math.random() * 100 - 50), 
+           y: hasPosition ? d.y : dimensions.height / 2 + (Math.random() * 100 - 50),
+
+           // Only lock (fx/fy) if we actually have a saved position that isn't 0,0
+           fx: hasPosition ? d.x : null,
+           fy: hasPosition ? d.y : null
+        };
+    });
     
     const d3Links: any[] = [];
     d3Nodes.forEach(node => {
@@ -62,32 +103,54 @@ export default function MindMapGraph({ data, onNodeClick, onNodeDoubleClick, sel
     });
 
     const simulation = d3.forceSimulation(d3Nodes as any)
-      .force("link", d3.forceLink(d3Links).id((d: any) => d.id).distance(150))
-      .force("charge", d3.forceManyBody().strength(-400))
-      .force("center", d3.forceCenter(dimensions.width / 2, dimensions.height / 2))
-      .force("collide", d3.forceCollide().radius(50))
-      .alphaMin(0.01); // Stops the simulation sooner so it doesn't "jitter"
+//      .force("link", d3.forceLink(d3Links).id((d: any) => d.id).distance(150))
+//      .force("charge", d3.forceManyBody().strength(-400))
+//      .force("center", d3.forceCenter(dimensions.width / 2, dimensions.height / 2))
+//      .force("collide", d3.forceCollide().radius(50))
+  //    .alphaMin(0.01); // Stops the simulation sooner so it doesn't "jitter"
 
     if (selectedNodeId) {
-        simulation.alpha(0.1).restart(); // Use a low alpha so it doesn't explode outward
+//        simulation.alpha(0.1).restart(); // Use a low alpha so it doesn't explode outward
 }
 
     const link = g.append("g").attr("stroke", "#555").selectAll("line").data(d3Links).join("line").attr("stroke-width", 2).attr("opacity", 0.6);
 
+
     const nodeGroup = g.append("g").selectAll("g").data(d3Nodes).join("g")
+      .attr("id", (d: any) => `node-group-${d.id}`) // CRITICAL for WebSocket updates
       .call(d3.drag()
-          .on("start", (e, d: any) => { if (!e.active) simulation.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; })
-          .on("drag", (e, d: any) => { d.fx = e.x; d.fy = e.y; })
-          .on("end", (e, d: any) => { 
-              if (!e.active) simulation.alphaTarget(0); 
-              d.fx = null; d.fy = null;
-              // PERSISTENCE: Save new position to DB
-              fetch(`https://10.10.0.1/api/mindmap/node/${d.id}`, {
-                  method: 'PUT',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ name: d.name, description: d.description, extraMeta: d.metadata, x: d.x, y: d.y })
-              });
-          }) as any
+          .on("start", (e, d: any) => { 
+              if (!e.active) simulation.alphaTarget(0.3).restart(); 
+              d.fx = d.x; d.fy = d.y; 
+          })
+          .on("drag", (e, d: any) => { 
+              d.fx = e.x; d.fy = e.y; 
+              
+              // 1. FAST LANE: Tell other users where we are moving
+              // Use socketRef.current.emit to avoid the lag of the old fetch
+              socketRef.current?.emit('node_move', { id: d.id, x: e.x, y: e.y });
+          })
+         .on("end", (e, d: any) => {
+             if (!e.active) simulation.alphaTarget(0);
+
+    // 1. Capture the mouse position immediately
+             const finalX = e.x;
+             const finalY = e.y;
+
+    // 2. LOCK it so it stays there on screen
+            d.fx = finalX;
+            d.fy = finalY;
+
+    // 3. Use the captured numbers for the socket
+           console.log("Saving to DB:", d.id, finalX, finalY);
+           socketRef.current?.emit('node_drag_end', {
+               id: Number(d.id),
+               x: finalX,
+               y: finalY
+    });
+
+    console.log("Drag ended, position saved via WebSocket");
+})     as any
       )
       .on("click", (e, d) => { e.stopPropagation(); onNodeClick(d as any); })
       .on("dblclick", (e, d) => { e.stopPropagation(); onNodeDoubleClick(d as any); })

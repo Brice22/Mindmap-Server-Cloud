@@ -29,8 +29,17 @@ export default function Dashboard() {
   useEffect(() => { fetchNodes(); }, []);
   const fetchNodes = async () => {
     try {
-      const res = await fetch('https://10.10.0.1/api/mindmap');
-      if (res.ok) setNodes(await res.json());
+      // FIX: Add timestamp (?t=...) and 'no-store' to force fresh data every time
+      const res = await fetch(`https://10.10.0.1/api/mindmap?t=${Date.now()}`, { 
+        cache: 'no-store',
+        headers: { 'Cache-Control': 'no-cache' } 
+      });
+      
+      if (res.ok) {
+        const data = await res.json();
+        console.log("FRESH DATA RECEIVED:", data.find((n: any) => n.id === 1)); // Debug log
+        setNodes(data);
+      }
     } catch (e) { console.error(e); }
   };
 
