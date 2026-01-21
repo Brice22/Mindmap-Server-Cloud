@@ -70,14 +70,21 @@ export class MindmapService {
     return result.rows[0];
   }
 
-  async updateNode(id: number, name: string, description: string, extraMeta: any, x?: number, y?: number) {
+  async updateNode(id: number, name?: string, description?: string, extraMeta?: any, x?: number, y?: number) {
+     console.log(`SERVICE DATA RECEIVED - ID: ${id}, X: ${x} (Type: ${typeof x}), Y: ${y}`);
     const check = await this.db.query('SELECT * FROM mindmap_nodes WHERE id = $1', [id]);
-    if (check.rows.length === 0) throw new NotFoundException('Node not found');
+    if (check.rows.length === 0) {
+    console.error("Node not found, skipping update.");
+    return null;
+}
 
+    const row = check.rows[0];
+    const finalName = name !== undefined ? name : row.name;
+    const finalDesc = description !== undefined ? description : row.description;
     const oldMeta = check.rows[0].metadata || {};
     const finalMeta = { ...oldMeta, ...extraMeta };
-    const finalX = x !== undefined ? x : check.rows[0].x;
-    const finalY = y !== undefined ? y : check.rows[0].y;
+    const finalX = x !== undefined ? Math.round(Number(x)) : row.x;
+    const finalY = y !== undefined ? Math.round(Number(y)) : row.y;
 
     const sql = `
       UPDATE mindmap_nodes
@@ -85,19 +92,19 @@ export class MindmapService {
       WHERE id = $6
       RETURNING *;
     `;
-    const result = await this.db.query(sql, [name, description, JSON.stringify(finalMeta), finalX, finalY, id]);
+    const result = await this.db.query(sql, [finalName, finalDesc, JSON.stringify(finalMeta), finalX, finalY, id]);
 
     // Sync Search
-    await this.client.index('nodes').addDocuments([{
+try {
+    await this.client.index('nodes').updateDocuments([{
       id: result.rows[0].id,
       name: result.rows[0].name,
       description: result.rows[0].description
     }]);
-
-    if (finalMeta.parent) {
-      await this.syncRelationship(id, finalMeta.parent);
-    }
-
-    return result.rows[0];
-  }
+} catch (e) {
+    console.error("MeiliSearch Sync Failed", e.message); 
+}
+return result.rows[0];
+}
+   
 }
